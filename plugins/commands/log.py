@@ -6,8 +6,16 @@ Logging ke channel owner:
   - /list (owner DM) → lihat semua grup aktif
   - Log deteksi alasan pesan dihapus (group=3)
 
-Desain log SERAGAM: semua pakai header ❖ JUDUL ❖ + blockquote isi.
-Tiap jenis pelanggaran punya detail alasan spesifik (bukan generic).
+Desain log SERAGAM: semua pakai header ❖ ICON LABEL ❖ + isi sebagai teks
+biasa (TIDAK pakai <blockquote> — Pyrogram 2.0.106 menolak sebagian pesan
+dengan ENTITY_BOUNDS_INVALID saat tag ini dipakai, lihat riwayat perubahan).
+
+ICON + LABEL header SELALU diambil dari core/violation_types.py (SATU
+sumber kebenaran) — TIDAK ADA keyword-matching atau icon_map lokal di
+file ini lagi. Setiap jenis pelanggaran punya kode VIOLATION_* sendiri,
+dan kode yang sama dipakai juga untuk panel log per grup (insert_group_
+action_log(..., jenis=...)), sehingga LOG_CHANNEL dan panel grup selalu
+tampil dengan icon + label yang identik untuk jenis pelanggaran yang sama.
 """
 
 import os
@@ -29,6 +37,13 @@ from database import (
 )
 from core.regex_utils import remove_mentions_for_regex, match_with_leet
 from plugins.nexus.engine import pipeline_pembersihan
+from core.violation_types import (
+    VIOLATION_REGEX_GLOBAL, VIOLATION_REGEX_GRUP, VIOLATION_DUPLIKAT_LOKAL,
+    VIOLATION_GCAST_GLOBAL, VIOLATION_BIO_LINK, VIOLATION_LINK_PESAN,
+    VIOLATION_MENTION_NON_MEMBER, VIOLATION_MUTE_SENYAP,
+    VIOLATION_NEXUS_AI, VIOLATION_SISTEM_GRUP_BARU,
+    format_violation_header,
+)
 
 OWNER_ID    = int(os.environ.get("OWNER_ID", 0))
 LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", 0))
@@ -188,15 +203,12 @@ async def log_new_group(client: Client, message: Message):
         if member.id == me.id:
             chat  = message.chat
             text  = (
-                "<b>❖ SISTEM — NODE BARU ❖</b>\n"
-                "<blockquote>"
-                "➕ Bot bergabung ke grup baru\n"
+                f"<b>❖ {format_violation_header(VIOLATION_SISTEM_GRUP_BARU)} ❖</b>\n"
                 f"◈ <b>Grup:</b> {html.escape(chat.title)}\n"
                 f"◈ <b>ID:</b> <code>{chat.id}</code>\n"
                 f"◈ <b>Username:</b> @{chat.username if chat.username else '—'}\n"
                 f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
                 "<i>Firewall aktif pada grup ini.</i>"
-                "</blockquote>"
             )
             await _send_log(client, text)
 
@@ -272,7 +284,7 @@ async def log_deletion_trigger(client: Client, message: Message):
         return
 
     cfg    = await get_config(cid)
-    alasan = None
+    kode   = None   # kode VIOLATION_* (core/violation_types.py) — bukan teks bebas
     detail = ""
     now_ts = time.time()
     regex_safe       = remove_mentions_for_regex(message)
@@ -289,7 +301,7 @@ async def log_deletion_trigger(client: Client, message: Message):
             continue
         if match_with_leet(pat, regex_safe) or (teks_super_clean and pat.search(teks_super_clean)):
             raw_tag = html.escape(str(doc.get("raw", pat.pattern)))
-            alasan  = "Filter Regex Global"
+            kode    = VIOLATION_REGEX_GLOBAL
             detail  = (
                 f"◈ <b>Pola cocok:</b> <code>{raw_tag}</code>\n"
                 f"◈ <b>Keterangan:</b> Kata kunci dalam daftar filter owner"
@@ -297,10 +309,10 @@ async def log_deletion_trigger(client: Client, message: Message):
             break
 
     # Regex lokal (Group Filter)
-    if not alasan:
+    if not kode:
         for pat, raw_pattern in await _get_local_patterns_log(cid):
             if match_with_leet(pat, regex_safe):
-                alasan = "Filter Regex Grup"
+                kode   = VIOLATION_REGEX_GRUP
                 detail = (
                     f"◈ <b>Pola cocok:</b> <code>{html.escape(str(raw_pattern))}</code>\n"
                     f"◈ <b>Keterangan:</b> Kata kunci dalam filter lokal grup ini"
@@ -308,38 +320,38 @@ async def log_deletion_trigger(client: Client, message: Message):
                 break
 
     # Anti-duplikasi lokal
-    if not alasan and cfg.get("local") is True:
+    if not kode and cfg.get("local") is True:
         lokal_record = await messages_db.find_one({
             "chat_id": cid, "msg_id": message.id, "type": "local_track"
         })
         if lokal_record and lokal_record.get("warned") is True:
-            alasan = "Anti-Spam Duplikat Lokal"
+            kode   = VIOLATION_DUPLIKAT_LOKAL
             detail = (
-                "◈ <b>Keterangan:</b> Pesan identik/mirip dikirim berulang\n"
+                "◈ <b>Keterangan:</b> Pesan identik/mirip dikirim berulang dalam grup ini\n"
                 f"◈ <b>Interval deteksi:</b> {cfg.get('expiry', 60)} detik"
             )
 
     # Anti-gcast global
-    if not alasan and cfg.get("global") is True:
+    if not kode and cfg.get("global") is True:
         content_hash = hashlib.md5(content.encode()).hexdigest()
         global_key   = f"glob_{uid}_{content_hash}"
         existing     = await messages_db.find_one({"_id": global_key})
         if existing and (now_ts - existing.get("time", 0)) < GLOBAL_EXPIRY:
             if len(existing.get("locations", [])) >= 2:
                 locs   = existing.get("locations", [])
-                alasan = "Anti-Broadcast Gcast Global"
+                kode   = VIOLATION_GCAST_GLOBAL
                 detail = (
-                    f"◈ <b>Keterangan:</b> Pesan disebar serentak ke {len(locs)} grup\n"
-                    "◈ <b>Indikator:</b> Konten identik muncul di beberapa grup dalam waktu singkat"
+                    f"◈ <b>Keterangan:</b> Pesan identik disebar serentak ke {len(locs)} grup\n"
+                    "◈ <b>Indikator:</b> Konten sama muncul di beberapa grup dalam waktu singkat"
                 )
 
     # Bio link
-    if not alasan and cfg.get("bio_check") is True:
+    if not kode and cfg.get("bio_check") is True:
         try:
             from plugins.filters.bio import _bio_cache
             hit = _bio_cache.get(uid)
             if hit and hit[0] is True:
-                alasan = "Bio Link Detector"
+                kode   = VIOLATION_BIO_LINK
                 detail = (
                     "◈ <b>Keterangan:</b> Profil bio user mengandung tautan/link\n"
                     "◈ <b>Kebijakan:</b> Pesan dari user berbio link dihapus otomatis"
@@ -348,22 +360,22 @@ async def log_deletion_trigger(client: Client, message: Message):
             pass
 
     # Link detector
-    if not alasan:
+    if not kode:
         url_types    = {MessageEntityType.URL, MessageEntityType.TEXT_LINK}
         all_entities = list(message.entities or []) + list(message.caption_entities or [])
         if any(e.type in url_types for e in all_entities):
-            alasan = "Link Detector"
+            kode   = VIOLATION_LINK_PESAN
             detail = (
                 "◈ <b>Keterangan:</b> Pesan mengandung tautan/URL aktif\n"
                 "◈ <b>Kebijakan:</b> Pengiriman link tidak diizinkan di grup ini"
             )
 
     # External mention
-    if not alasan and cfg.get("anti_mention", True) is True:
+    if not kode and cfg.get("anti_mention", True) is True:
         try:
             from plugins.filters.antispam import _is_external_mention
             if await _is_external_mention(client, message):
-                alasan = "Mention Pengguna Luar Grup"
+                kode   = VIOLATION_MENTION_NON_MEMBER
                 detail = (
                     "◈ <b>Keterangan:</b> Pesan menyebut user yang bukan anggota grup\n"
                     "◈ <b>Indikator:</b> Pola mention spam untuk menarik orang luar"
@@ -372,13 +384,13 @@ async def log_deletion_trigger(client: Client, message: Message):
             pass
 
     # Hapus silent — user masih dalam masa mute aktif
-    if not alasan and cfg.get("local") is True:
+    if not kode and cfg.get("local") is True:
         try:
             from database import get_local_mute
             mute_rec = await get_local_mute(cid, uid)
             if mute_rec.get("muted_until", 0.0) > now_ts:
                 until_dt = datetime.fromtimestamp(mute_rec["muted_until"], tz=TZ_WIB)
-                alasan = "Hapus Senyap — Masa Mute Aktif"
+                kode   = VIOLATION_MUTE_SENYAP
                 detail = (
                     f"◈ <b>Keterangan:</b> User masih di-mute, pesan otomatis dihapus\n"
                     f"◈ <b>Mute berakhir:</b> {until_dt.strftime('%H:%M:%S WIB')}"
@@ -386,33 +398,18 @@ async def log_deletion_trigger(client: Client, message: Message):
         except Exception:
             pass
 
-    if not alasan:
+    if not kode:
         return
 
-    # ── Peta ikon per jenis pelanggaran ──────────────────────────────────────
-    icon_map = {
-        "Filter Regex Global":              "🚫",
-        "Filter Regex Grup":               "🔡",
-        "Anti-Spam Duplikat Lokal":        "🔁",
-        "Anti-Broadcast Gcast Global":     "🌐",
-        "Bio Link Detector":               "🔍",
-        "Link Detector":                   "🔗",
-        "Mention Pengguna Luar Grup":      "👤",
-        "Hapus Senyap — Masa Mute Aktif":  "🔇",
-    }
-    icon         = icon_map.get(alasan, "⚠️")
     user_mention = _user_line(uid, message.from_user.first_name)
 
     log_text = (
-        f"<b>❖ HAPUS OTOMATIS — {alasan.upper()} ❖</b>\n"
-        "<blockquote>"
-        f"{icon} <b>Tipe:</b> {alasan}\n"
+        f"<b>❖ {format_violation_header(kode)} ❖</b>\n"
         f"◈ <b>User:</b> {user_mention}\n"
         f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
         f"{detail}\n\n"
         f"📨 <b>Konten:</b>\n<code>{html.escape(content[:500])}</code>"
-        "</blockquote>"
     )
     await _send_log(client, log_text)
 
@@ -426,16 +423,13 @@ async def log_spam_global(client: Client, message: Message, pola: str, indikator
     user_mention = _user_line(uid, message.from_user.first_name)
 
     log_text = (
-        "<b>❖ HAPUS OTOMATIS — NEXUS AI GLOBAL ❖</b>\n"
-        "<blockquote>"
-        f"🌐 <b>Tipe:</b> Deteksi AI Global\n"
+        f"<b>❖ {format_violation_header(VIOLATION_NEXUS_AI)} ❖</b>\n"
         f"◈ <b>User:</b> {user_mention}\n"
         f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
-        f"◈ <b>Keterangan:</b> Model AI mendeteksi pola spam lintas grup\n"
+        f"◈ <b>Keterangan:</b> Model AI mendeteksi pola spam lintas grup (filter global)\n"
         f"◈ <b>Indikator AI:</b> <code>{html.escape(str(indikator))}</code>\n"
         f"◈ <b>Pola terdeteksi:</b> <code>{html.escape(str(pola)[:80])}</code>"
-        "</blockquote>"
     )
     await _send_log(client, log_text)
 
@@ -447,27 +441,24 @@ async def log_spam_lokal(client: Client, message: Message, pola: str, indikator:
     user_mention = _user_line(uid, message.from_user.first_name)
 
     log_text = (
-        "<b>❖ HAPUS OTOMATIS — NEXUS AI OWNER ❖</b>\n"
-        "<blockquote>"
-        f"⚙️ <b>Tipe:</b> Filter Manual Owner (Nexus AI)\n"
+        f"<b>❖ {format_violation_header(VIOLATION_NEXUS_AI)} ❖</b>\n"
         f"◈ <b>User:</b> {user_mention}\n"
         f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
         f"◈ <b>Keterangan:</b> Cocok dengan filter kata yang diset owner\n"
         f"◈ <b>Indikator AI:</b> <code>{html.escape(str(indikator))}</code>\n"
         f"◈ <b>Pola terdeteksi:</b> <code>{html.escape(str(pola)[:80])}</code>"
-        "</blockquote>"
     )
     await _send_log(client, log_text)
 
 
 async def log_sistem(client: Client, judul: str, pesan: str):
-    """Log notifikasi sistem ke channel."""
+    """Log notifikasi sistem ke channel — tetap pakai judul bebas (bukan
+    pelanggaran), TIDAK lewat registry violation_types karena ini bukan
+    salah satu jenis pelanggaran yang diregistrasi."""
     log_text = (
-        f"<b>❖ SISTEM — {judul.upper()} ❖</b>\n"
-        "<blockquote>"
-        f"⚡ <b>Waktu:</b> {_fmt_waktu()}\n"
+        f"<b>❖ ⚡ {judul.upper()} ❖</b>\n"
+        f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
         f"{pesan}"
-        "</blockquote>"
     )
     await _send_log(client, log_text)
