@@ -60,6 +60,13 @@ API_HASH  = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CODE_BOT  = os.environ.get("CODE_BOT", "").strip()
 
+# Set "1"/"true" di .env (REWARM_USER_ENABLED) jika suatu saat fitur DM ke user
+# dari dm_users_db atau group_action_log_db benar-benar dibutuhkan kembali.
+# Default off (0) karena saat ini tidak ada fitur yang mengirim DM ke user
+# dari kedua sumber tersebut — rewarm user hanya membuang panggilan get_users()
+# tanpa manfaat, dan jumlah gagal akan terus naik mengikuti jumlah entri di DB.
+REWARM_USER_ENABLED = os.environ.get("REWARM_USER_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+
 # ── Session name — berbasis CODE_BOT jika tersedia, fallback ke bot_id ────────
 # Jika CODE_BOT diset:
 #   • Semua bot dengan CODE_BOT yang sama berbagi satu file session.
@@ -437,24 +444,28 @@ async def _rewarm_known_peers(client) -> None:
         except Exception:
             pass
 
-    # User dari dm_users
-    try:
-        from database import get_all_dm_users
-        dm_users = await get_all_dm_users()
-        for uid in dm_users:
-            if uid:
-                user_ids.add(int(uid))
-    except Exception as e:
-        print(f"[Rewarm] ⚠️  Gagal baca dm_users_db: {e}")
+    # User dari dm_users + group_action_log — DINONAKTIFKAN secara default (lihat
+    # REWARM_USER_ENABLED di atas). Pengumpulan user_ids dilewati sepenuhnya
+    # agar tidak ada kerja sia-sia membaca koleksi ini setiap startup.
+    if REWARM_USER_ENABLED:
+        # User dari dm_users
+        try:
+            from database import get_all_dm_users
+            dm_users = await get_all_dm_users()
+            for uid in dm_users:
+                if uid:
+                    user_ids.add(int(uid))
+        except Exception as e:
+            print(f"[Rewarm] ⚠️  Gagal baca dm_users_db: {e}")
 
-    # User dari group_action_log
-    try:
-        async for doc in group_action_log_db.find({}):
-            uid = doc.get("user_id")
-            if uid:
-                user_ids.add(int(uid))
-    except Exception as e:
-        print(f"[Rewarm] ⚠️  Gagal baca group_action_log_db: {e}")
+        # User dari group_action_log
+        try:
+            async for doc in group_action_log_db.find({}):
+                uid = doc.get("user_id")
+                if uid:
+                    user_ids.add(int(uid))
+        except Exception as e:
+            print(f"[Rewarm] ⚠️  Gagal baca group_action_log_db: {e}")
     
     # Resolve grup/channel — prioritas @username (tidak butuh access hash di sesi baru),
     # fallback ke integer ID (butuh access hash; mungkin gagal di sesi baru).
@@ -483,6 +494,16 @@ async def _rewarm_known_peers(client) -> None:
     # startup. Sebelumnya loop ini di-await langsung; jika dm_users atau
     # group_action_log_db punya banyak entri, startup bisa macet di sini
     # puluhan detik sebelum sempat menjalankan blok monitor bot.
+    #
+    # DINONAKTIFKAN via REWARM_USER_ENABLED (lihat definisi flag di atas):
+    # tidak ada fitur bot yang mengirim pesan ke user dari dm_users_db atau
+    # group_action_log_db, sehingga rewarm ini selama ini hanya membuang
+    # panggilan get_users() tanpa manfaat. Kode di bawah TETAP ada (tidak
+    # dihapus) untuk diaktifkan kembali via .env kapan saja tanpa ubah kode.
+    if not REWARM_USER_ENABLED:
+        print("[Rewarm] ℹ️  Rewarm User dilewati (REWARM_USER_ENABLED=0).")
+        return
+
     user_list = list(user_ids)
 
     async def _rewarm_users_bg():
