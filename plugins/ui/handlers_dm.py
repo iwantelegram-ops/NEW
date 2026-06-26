@@ -21,7 +21,6 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import MessageNotModified, MessageIdInvalid, BadRequest, FloodWait
 import pyrogram.raw.functions as _raw_fns
 from pyrogram.raw.types import (
-    MessageEntityBlockquote as _RawBQ,
     MessageEntityBold       as _RawBold,
 )
 
@@ -172,11 +171,12 @@ async def edit_with_bq(client, msg, text: str, keyboard=None):
     """
     Edit pesan dengan marker kustom untuk formatting:
       [B]...[/B]   → Bold entity
-      [BQ]...[/BQ] → Blockquote via raw Pyrogram API
 
-    FIXED: Hapus collapsed=True dari _RawBQ karena parameter ini tidak didukung
-    di Pyrogram 2.0.106 (MessageEntityBlockquote.__init__ unexpected keyword).
-    Fallback ke safe_edit jika raw API gagal.
+    CATATAN: [BQ]...[/BQ] (blockquote) TIDAK didukung Pyrogram 2.0.106 —
+    MessageEntityBlockquote di versi ini menyebabkan Telegram menolak pesan
+    dengan ENTITY_BOUNDS_INVALID pada sebagian kasus. Marker [BQ]/[/BQ]
+    karena itu HANYA dihapus dari teks (jadi teks biasa, tanpa formatting
+    blockquote apapun) — bukan diubah jadi entity.
     """
     import re as _re
     SPLIT_RE = _re.compile(r'(\[B\]|\[/B\]|\[BQ\]|\[/BQ\])')
@@ -184,7 +184,6 @@ async def edit_with_bq(client, msg, text: str, keyboard=None):
     entities   = []
     plain      = ""
     bold_start = None
-    bq_start   = None
 
     for token in SPLIT_RE.split(text):
         if token == "[B]":
@@ -195,14 +194,10 @@ async def edit_with_bq(client, msg, text: str, keyboard=None):
                 if length > 0:
                     entities.append(_RawBold(offset=bold_start, length=length))
                 bold_start = None
-        elif token == "[BQ]":
-            bq_start = _utf16_len(plain)
-        elif token == "[/BQ]":
-            if bq_start is not None:
-                length = _utf16_len(plain) - bq_start
-                if length > 0:
-                    entities.append(_RawBQ(offset=bq_start, length=length))
-                bq_start = None
+        elif token in ("[BQ]", "[/BQ]"):
+            # Blockquote tidak didukung — buang marker-nya, teks di antaranya
+            # tetap masuk apa adanya sebagai teks biasa (lihat docstring).
+            continue
         else:
             plain += token
 
@@ -229,7 +224,7 @@ async def edit_with_bq(client, msg, text: str, keyboard=None):
         fallback = (
             text
             .replace("[B]", "<b>").replace("[/B]", "</b>")
-            .replace("[BQ]", "<blockquote>").replace("[/BQ]", "</blockquote>")
+            .replace("[BQ]", "").replace("[/BQ]", "")
         )
         await safe_edit(msg, fallback, keyboard)
 

@@ -918,11 +918,9 @@ async def page_group_log(chat_id: int, page: int = 1):
 
         entry = (
             f"{aksi_icon} <b>{aksi_label}</b>  <i>{ts_str}</i>\n"
-            f"<blockquote>"
             f"👤 {nama} (<code>{uid_val}</code>)\n"
             f"{alasan_icon} {alasan}"
             f"{konten_line}"
-            f"</blockquote>"
         )
         entries.append(entry)
 
