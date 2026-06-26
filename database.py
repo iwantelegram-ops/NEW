@@ -1984,7 +1984,7 @@ async def delete_worker(client) -> None:
     # Jika hanya ada 1 spam dan tidak ada yang menyusul → tetap dihapus
     # setelah _BATCH_WINDOW habis. Delay maksimal = _BATCH_WINDOW detik.
     # ─────────────────────────────────────────────────────────────────────────
-    _BATCH_WINDOW = 0.8   # detik menunggu item berikutnya sebelum flush
+    _BATCH_WINDOW = 0.2   # detik menunggu item berikutnya sebelum flush
     _IDLE_TIMEOUT = 5.0   # detik poll saat queue kosong (flush pending sisa)
 
     while True:
@@ -2904,13 +2904,22 @@ async def _ensure_group_action_log_index() -> None:
 
 async def insert_group_action_log(
     chat_id:   int,
-    aksi:      str,   # "HAPUS" | "MUTE" | "BAN"
-    alasan:    str,   # bahasa sederhana untuk admin
+    aksi:      str,   # "HAPUS" | "MUTE" | "BAN" | "UNADMIN" | "SECOS" | "MUTE-VC-MIC" | "UNMUTE-VC-MIC"
+    alasan:    str,   # teks detail bebas (pola cocok, durasi, dll) — BUKAN label jenis
     user_id:   int,
     user_name: str,
     konten:    str = "",
+    jenis:     str | None = None,   # kode VIOLATION_* dari core/violation_types.py
 ) -> None:
-    """Simpan satu entri log aksi ke group_action_log. Non-blocking, gagal diam-diam."""
+    """
+    Simpan satu entri log aksi ke group_action_log. Non-blocking, gagal diam-diam.
+
+    `jenis` (BARU): kode terstruktur (lihat core/violation_types.py) yang
+    menentukan icon + label Indonesia seragam di panel log grup & LOG_CHANNEL.
+    Opsional untuk backward-compat — entri tanpa `jenis` (atau ditulis sebelum
+    field ini ada) tetap tampil lewat fallback generik di violation_types.py,
+    tidak pernah error.
+    """
     try:
         doc = {
             "chat_id":   chat_id,
@@ -2920,6 +2929,7 @@ async def insert_group_action_log(
             "user_id":   user_id,
             "user_name": user_name[:50],
             "konten":    konten[:100],
+            "jenis":     jenis,
         }
         await group_action_log_db.insert_one(doc)
     except Exception as e:

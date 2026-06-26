@@ -731,14 +731,25 @@ async def graceful_shutdown():
     except Exception as e:
         print(f"[Shutdown] ⚠️  Gagal simpan/stop session userbot: {e}")
 
-    # Bengkel: putus semua koneksi token backup. Tidak ada session penting
-    # yang perlu dibackup di sini — token backup tidak menyimpan peer cache
-    # grup manapun (stateless, hanya dipakai sesaat untuk GetFullUser).
+    # Bengkel (mode lama, standalone): putus semua koneksi token backup.
+    # Tidak ada session penting yang perlu dibackup di sini — token backup
+    # tidak menyimpan peer cache grup manapun (stateless, hanya dipakai
+    # sesaat untuk GetFullUser).
     try:
         from core.workshop_pool import workshop_pool
         await workshop_pool.stop_all()
     except Exception as e:
         print(f"[Shutdown] ⚠️  Gagal stop Bengkel: {e}")
+
+    # Bengkel Join Pool (mode baru): BERBEDA dari di atas — Bengkel di sini
+    # mungkin sedang JADI MEMBER di suatu grup. stop_all() akan leave_chat()
+    # dengan rapi dulu sebelum disconnect, supaya tidak ada Bengkel yang
+    # "nyangkut" sebagai member grup setelah proses berhenti/redeploy.
+    try:
+        from core.workshop_join_pool import workshop_join_pool
+        await workshop_join_pool.stop_all()
+    except Exception as e:
+        print(f"[Shutdown] ⚠️  Gagal stop Bengkel Join: {e}")
 
     await _notify_owner()
 
@@ -838,6 +849,20 @@ async def main():
     # Background task delete_worker dijalankan SETELAH app.start() agar client
     # sudah terkoneksi saat worker pertama kali mencoba menghapus pesan.
     asyncio.create_task(delete_worker(app))
+
+    # ── Bengkel Join Pool: bot bengkel yang bisa masuk/keluar grup ───────────
+    # Login token backup (sama dengan workshop_pool di atas, tapi role
+    # berbeda — masuk grup sebagai member, bukan standalone) DAN bootstrap
+    # resolvability ke bot utama (kirim 1x DM). Harus setelah app.start()
+    # karena perlu app.get_me() (untuk DM bootstrap) dan nanti
+    # add_chat_members() butuh app yang sudah terkoneksi.
+    try:
+        from core.workshop_join_pool import workshop_join_pool
+        if workshop_join_pool.size > 0:
+            asyncio.create_task(workshop_join_pool.start_all(app))
+            print(f"[BengkelJoin] 🔧 {workshop_join_pool.size} Bengkel join terdeteksi, login + bootstrap di background...")
+    except Exception as e:
+        print(f"[BengkelJoin] Gagal inisialisasi pool: {e}")
 
     # Background task moderation_worker_loop — eksekusi mute/unmute/ban satu
     # per satu dengan jeda kecil antar aksi, agar tidak ada banyak aksi
