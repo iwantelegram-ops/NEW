@@ -35,6 +35,9 @@ from database import (
 )
 from core.group_notify import send_group_notice
 from core.moderation_queue import queue_mute
+from core.violation_types import (
+    VIOLATION_MUTE_ESKALASI, VIOLATION_MUTE_GAGAL, format_violation_header,
+)
 
 LOG_CHANNEL         = int(os.environ.get("LOG_CHANNEL", 0))
 SPAM_MUTE_THRESHOLD = 10   # Jumlah pelanggaran sebelum mute diterapkan
@@ -53,6 +56,13 @@ async def check_and_punish(
     — aksi mute dieksekusi oleh worker terpisah, BUKAN langsung di sini, agar
     banyak mute yang terjadi bersamaan saat raid tidak ditembak serentak ke
     Telegram API dan memicu FloodWait).
+
+    `spam_type` (jenis pemicu, mis. "filter kata global") HANYA dipakai untuk
+    pesan singkat di grup ("...di-mute karena X berulang") — TIDAK lagi
+    ditampilkan di LOG_CHANNEL/panel sebagai bagian dari label utama. Label
+    log mute eskalasi SELALU generik ("🔇 Mute Eskalasi (10× Berulang)"),
+    sesuai desain: yang penting tercatat adalah AMBANG 10× tercapai, bukan
+    jenis pemicu spesifiknya (lihat VIOLATION_MUTE_ESKALASI).
 
     Return True jika mute BERHASIL DIANTRIKAN (bukan berarti sudah dieksekusi
     — eksekusi & notifikasi terjadi async di moderation_worker_loop).
@@ -124,42 +134,16 @@ async def _log_mute_failed(client, message, spam_type: str) -> None:
     cid          = message.chat.id
     user_mention = _user_line(uid, message.from_user.first_name)
 
-    # Detail alasan per jenis pelanggaran
-    detail = _mute_detail(spam_type)
-    spam_type_safe = html.escape(spam_type)
-
     log_text = (
-        "<b>❖ MUTE GAGAL — IZIN BOT TIDAK CUKUP ❖</b>\n"
-        "<blockquote>"
-        f"⚠️ <b>Tipe:</b> Eksekusi Mute Gagal\n"
+        f"<b>❖ {format_violation_header(VIOLATION_MUTE_GAGAL)} ❖</b>\n"
         f"◈ <b>User:</b> {user_mention}\n"
         f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
-        f"◈ <b>Pemicu:</b> {spam_type_safe} — 10× berturut-turut\n"
-        f"{detail}\n"
+        f"◈ <b>Keterangan:</b> Melanggar 10× berturut-turut, tapi eksekusi mute gagal\n"
         f"◈ <b>Sebab gagal:</b> Bot bukan admin / tidak punya izin restrict\n"
         f"<i>Pesan user tidak dianggap masa mute — cek izin admin bot di grup ini.</i>"
-        "</blockquote>"
     )
     await _send_log(client, log_text)
-
-
-def _mute_detail(spam_type: str) -> str:
-    """Kembalikan baris detail alasan mute berdasarkan jenis spam."""
-    _map = {
-        "filter kata global":       "◈ <b>Keterangan:</b> Pelanggaran filter kata dari daftar owner berulang kali",
-        "filter kata grup":         "◈ <b>Keterangan:</b> Pelanggaran filter kata lokal grup berulang kali",
-        "mention pengguna luar":    "◈ <b>Keterangan:</b> Berulang kali menyebut user yang bukan anggota grup",
-        "link dalam pesan":         "◈ <b>Keterangan:</b> Berulang kali mengirim pesan berisi tautan/URL",
-        "spam duplikat lokal":      "◈ <b>Keterangan:</b> Berulang kali mengirim pesan duplikat/mirip dalam satu grup",
-        "anti-gcast global":        "◈ <b>Keterangan:</b> Berulang kali menyebar pesan identik ke banyak grup sekaligus",
-        "bio link":                 "◈ <b>Keterangan:</b> Berulang kali mengirim pesan dengan bio yang mengandung link",
-    }
-    key = spam_type.lower().strip()
-    for k, v in _map.items():
-        if k in key:
-            return v
-    return f"◈ <b>Keterangan:</b> Pelanggaran <i>{html.escape(spam_type)}</i> mencapai ambang batas"
 
 
 async def _log_mute(
@@ -171,7 +155,7 @@ async def _log_mute(
     spam_type: str,
     konten: str,
 ) -> None:
-    """Log aksi mute ke group action log dan LOG_CHANNEL."""
+    """Log aksi mute eskalasi ke group action log dan LOG_CHANNEL."""
     from plugins.commands.log import _send_log, _fmt_waktu, _user_line
 
     user_name = message.from_user.first_name or str(uid)
@@ -179,8 +163,9 @@ async def _log_mute(
     try:
         await insert_group_action_log(
             cid, "MUTE",
-            f"Mute {duration_min} mnt — {spam_type} 10×",
+            f"Mute {duration_min} mnt — melanggar 10× berturut-turut",
             uid, user_name, konten,
+            jenis=VIOLATION_MUTE_ESKALASI,
         )
     except Exception:
         pass
@@ -189,20 +174,14 @@ async def _log_mute(
         return
 
     user_mention = _user_line(uid, user_name)
-    detail       = _mute_detail(spam_type)
-    spam_type_safe = html.escape(spam_type)
 
     log_text = (
-        "<b>❖ MUTE OTOMATIS — AMBANG SPAM TERCAPAI ❖</b>\n"
-        "<blockquote>"
-        f"🔇 <b>Tipe:</b> Mute Otomatis Anti-Spam\n"
+        f"<b>❖ {format_violation_header(VIOLATION_MUTE_ESKALASI)} ❖</b>\n"
         f"◈ <b>User:</b> {user_mention}\n"
         f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
         f"◈ <b>Durasi:</b> {duration_min} menit\n"
-        f"◈ <b>Pemicu:</b> {spam_type_safe} — 10× berturut-turut\n"
-        f"{detail}\n\n"
+        f"◈ <b>Keterangan:</b> Melanggar 10× berturut-turut\n\n"
         f"📨 <b>Konten terakhir:</b>\n<code>{html.escape(konten[:300])}</code>"
-        "</blockquote>"
     )
     await _send_log(client, log_text)

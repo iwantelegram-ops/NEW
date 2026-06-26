@@ -54,6 +54,7 @@ from database import (
     ns_get_config, ns_get_current_admins, ns_remove_admin,
     insert_group_action_log, TZ_WIB,
 )
+from core.violation_types import VIOLATION_BIO_ADMIN_WAJIB, format_violation_header
 
 LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", 0))
 
@@ -192,6 +193,7 @@ async def enforce_admin_bio(client, chat_id: int, user_id: int, admin_bio_ok) ->
                 user_id,
                 user_name,
                 reason,
+                jenis=VIOLATION_BIO_ADMIN_WAJIB,
             )
         except Exception:
             pass
@@ -201,15 +203,12 @@ async def enforce_admin_bio(client, chat_id: int, user_id: int, admin_bio_ok) ->
             waktu       = datetime.now(TZ_WIB).strftime("%d/%m/%Y %H:%M:%S WIB")
             req_snippet = _html_escape(required_text) if required_text else "<i>(belum diisi owner)</i>"
             log_text = (
-                "<b>❖ BIO ADMIN WAJIB — NEWSCORE ❖</b>\n"
-                "👮 <b>Admin Di-unadmin Otomatis</b>\n"
-                "<blockquote>"
+                f"<b>❖ {format_violation_header(VIOLATION_BIO_ADMIN_WAJIB)} ❖</b>\n"
                 f"◈ <b>User:</b> {user_mention} (<code>{user_id}</code>)\n"
                 f"◈ <b>Grup:</b> {_html_escape(chat_title)} (<code>{chat_id}</code>)\n"
                 f"◈ <b>Waktu:</b> {waktu}\n"
                 f"◈ <b>Teks wajib:</b> <code>{req_snippet}</code>\n"
                 f"◈ <b>Alasan:</b> {reason}"
-                "</blockquote>"
             )
             try:
                 await client.send_message(

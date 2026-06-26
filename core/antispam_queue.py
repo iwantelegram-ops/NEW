@@ -187,6 +187,11 @@ async def _process_detection(client: "Client", message: "Message") -> None:
     from core.punishment import check_and_punish
     from core.group_notify import send_group_notice
     from plugins.nexus.engine import pipeline_pembersihan
+    from core.violation_types import (
+        VIOLATION_REGEX_GLOBAL, VIOLATION_REGEX_GRUP,
+        VIOLATION_MENTION_NON_MEMBER, VIOLATION_LINK_PESAN,
+        VIOLATION_DUPLIKAT_LOKAL, VIOLATION_GCAST_GLOBAL,
+    )
 
     # Import helper lokal dari antispam.py
     from plugins.filters.antispam import (
@@ -248,6 +253,7 @@ async def _process_detection(client: "Client", message: "Message") -> None:
             asyncio.create_task(insert_group_action_log(
                 cid, "HAPUS", f"Filter Regex Global — pola: {raw[:50]}",
                 uid, message.from_user.first_name or str(uid), content[:100],
+                jenis=VIOLATION_REGEX_GLOBAL,
             ))
             asyncio.create_task(check_and_punish(client, message, "filter kata global", content[:100]))
             _trigger_passive_learn_spam(content, confidence=1.0)
@@ -261,13 +267,22 @@ async def _process_detection(client: "Client", message: "Message") -> None:
             asyncio.create_task(insert_group_action_log(
                 cid, "HAPUS", f"Filter Regex Grup — pola: {raw[:50]}",
                 uid, message.from_user.first_name or str(uid), content[:100],
+                jenis=VIOLATION_REGEX_GRUP,
             ))
             asyncio.create_task(check_and_punish(client, message, "filter kata grup", content[:100]))
             _trigger_passive_learn_spam(content, confidence=1.0)
             return
 
     # ── 3. External mention (Telegram API call — koordinasi FloodWait) ────
-    if cfg.get("anti_mention", True):
+    # Tambahan "and message.entities": kalau pesan jelas-jelas tidak punya
+    # entity sama sekali (tidak ada @mention/link/dst terformat), lewati
+    # SELURUH blok ini — termasuk wait_global_flood_backoff() dan overhead
+    # asyncio.wait_for() pembungkus — bukan cuma andalkan guard internal
+    # _is_external_mention() (yang baru cek entities SETELAH masuk ke sini).
+    # _is_external_mention sendiri tetap punya guard yang sama sebagai
+    # lapisan kedua (defensif, kalau dipanggil dari tempat lain seperti
+    # plugins/commands/log.py).
+    if cfg.get("anti_mention", True) and message.entities:
         await wait_global_flood_backoff()
         try:
             is_ext = await asyncio.wait_for(
@@ -291,6 +306,7 @@ async def _process_detection(client: "Client", message: "Message") -> None:
             asyncio.create_task(insert_group_action_log(
                 cid, "HAPUS", "Mention Pengguna Luar Grup — sebut user bukan anggota",
                 uid, message.from_user.first_name or str(uid), content[:100],
+                jenis=VIOLATION_MENTION_NON_MEMBER,
             ))
             asyncio.create_task(check_and_punish(client, message, "mention pengguna luar", content[:100]))
             return
@@ -302,6 +318,7 @@ async def _process_detection(client: "Client", message: "Message") -> None:
         asyncio.create_task(insert_group_action_log(
             cid, "HAPUS", "Link Detector — URL/tautan aktif dalam pesan",
             uid, message.from_user.first_name or str(uid), content[:100],
+            jenis=VIOLATION_LINK_PESAN,
         ))
         asyncio.create_task(check_and_punish(client, message, "link dalam pesan", content[:100]))
         return
@@ -336,6 +353,7 @@ async def _process_detection(client: "Client", message: "Message") -> None:
             asyncio.create_task(insert_group_action_log(
                 cid, "HAPUS", "Anti-Spam Duplikat Lokal — pesan mirip dikirim berulang",
                 uid, message.from_user.first_name or str(uid), content[:100],
+                jenis=VIOLATION_DUPLIKAT_LOKAL,
             ))
             asyncio.create_task(check_and_punish(
                 client, message, "spam duplikat lokal", content[:100]
@@ -405,6 +423,7 @@ async def _process_detection(client: "Client", message: "Message") -> None:
                             loc_cid, "HAPUS",
                             f"Anti-Broadcast Gcast Global — disebar ke {n_chats} grup sekaligus",
                             uid, message.from_user.first_name or str(uid), content[:100],
+                            jenis=VIOLATION_GCAST_GLOBAL,
                         ))
                         if loc_cid == cid:
                             asyncio.create_task(check_and_punish(
