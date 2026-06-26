@@ -61,6 +61,7 @@ TZ_WIB      = timezone(timedelta(hours=7))
 
 from plugins.nexus.engine import pipeline_pembersihan, generate_regex_otomatis_async
 from core.punishment import check_and_punish
+from core.violation_types import VIOLATION_NEXUS_AI, VIOLATION_WHITELIST_SPARED, format_violation_header
 import admin_session as _adm_sess
 
 # ── [NEXUS AI CORE v3.1] Import — non-fatal jika tidak ada ───────────────────
@@ -460,16 +461,14 @@ async def _log_nexus_deleted(
         sumber = "📋 Regex Database"
 
     text = (
-        "<b>❖ NEXUS AI — PESAN DIHAPUS ❖</b>\n\n"
-        f"🗑️ <b>Eksekusi Filter: {sumber}</b>\n"
+        f"<b>❖ {format_violation_header(VIOLATION_NEXUS_AI)} ❖</b>\n"
+        f"◈ <b>Sumber deteksi:</b> {sumber}\n"
         f"◈ <b>User:</b> {user_mention} (<code>{uid}</code>)\n"
         f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
-        f"◈ <b>Waktu:</b> <code>{waktu}</code>\n\n"
-        "<b>▰▰▰ PEMICU SPAM AI ▰▰▰</b>\n"
-        f"🔑 <b>Kata Kunci Pemicu:</b> <code>{html.escape(str(kata_display))}</code>\n"
-        f"💥 <b>Pola Interlock:</b>\n<code>{html.escape(str(pola_str)[:300])}</code>\n\n"
-        "<b>▰▰▰ KONTEN PESAN ▰▰▰</b>\n"
-        f"<code>{html.escape(content[:400])}</code>"
+        f"◈ <b>Waktu:</b> {waktu}\n"
+        f"◈ <b>Kata kunci pemicu:</b> <code>{html.escape(str(kata_display))}</code>\n"
+        f"◈ <b>Pola interlock:</b> <code>{html.escape(str(pola_str)[:300])}</code>\n\n"
+        f"📨 <b>Konten:</b>\n<code>{html.escape(content[:400])}</code>"
     )
     try:
         await client.send_message(
@@ -505,20 +504,16 @@ async def _log_nexus_whitelist_spared(
     wl_kata_str  = ", ".join(f"<code>{html.escape(str(k))}</code>" for k in wl_kata_list) if wl_kata_list else f"<code>{wl_raw_safe}</code>"
 
     text = (
-        "<b>❖ NEXUS AI — PESAN DIAMANKAN WHITELIST ❖</b>\n\n"
-        "🛡️ <b>Pesan Lolos Penghapusan (Dilindungi Whitelist Nexus)</b>\n"
+        f"<b>❖ {format_violation_header(VIOLATION_WHITELIST_SPARED)} ❖</b>\n"
         f"◈ <b>User:</b> {user_mention} (<code>{uid}</code>)\n"
         f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
-        f"◈ <b>Waktu:</b> <code>{waktu}</code>\n\n"
-        "<b>▰▰▰ POLA SPAM AI YANG TERPICU ▰▰▰</b>\n"
-        f"🔑 <b>Kata Kunci Spam:</b> <code>{html.escape(str(kata_display))}</code>\n"
-        f"💥 <b>Pola Interlock Spam:</b>\n<code>{html.escape(str(spam_pola)[:300])}</code>\n\n"
-        "<b>▰▰▰ DILINDUNGI OLEH WHITELIST NEXUS ▰▰▰</b>\n"
-        f"🛡️ <b>Kata Aman:</b> {wl_kata_str}\n"
-        f"📝 <b>Raw Whitelist:</b> <code>{wl_raw_safe}</code>\n"
-        f"🔒 <b>Pola Whitelist:</b>\n<code>{html.escape(str(wl_pola)[:300])}</code>\n\n"
-        "<b>▰▰▰ KONTEN PESAN ▰▰▰</b>\n"
-        f"<code>{html.escape(content[:400])}</code>"
+        f"◈ <b>Waktu:</b> {waktu}\n"
+        f"◈ <b>Kata kunci spam terpicu:</b> <code>{html.escape(str(kata_display))}</code>\n"
+        f"◈ <b>Pola interlock spam:</b> <code>{html.escape(str(spam_pola)[:300])}</code>\n"
+        f"◈ <b>Dilindungi whitelist:</b> {wl_kata_str}\n"
+        f"◈ <b>Raw whitelist:</b> <code>{wl_raw_safe}</code>\n"
+        f"◈ <b>Pola whitelist:</b> <code>{html.escape(str(wl_pola)[:300])}</code>\n\n"
+        f"📨 <b>Konten:</b>\n<code>{html.escape(content[:400])}</code>"
     )
     try:
         await client.send_message(
@@ -578,19 +573,15 @@ async def _log_nexus_keroyok(
         )
 
     text = (
-        "<b>❖ NEXUS AI — PESAN DIHAPUS (ATURAN KEROYOKAN) ❖</b>\n\n"
-        "☠️ <b>Eksekusi Filter: MULTI-PATTERN AMBUSH</b>\n"
+        f"<b>❖ {format_violation_header(VIOLATION_NEXUS_AI)} (Multi-Pola) ❖</b>\n"
         f"◈ <b>User:</b> {user_mention} (<code>{uid}</code>)\n"
         f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
-        f"◈ <b>Waktu:</b> <code>{waktu}</code>\n\n"
-        f"⚠️ <b>{jumlah_racun} pola spam berbeda mendeteksi kecocokan sekaligus!</b>\n"
-        "<i>Whitelist tidak berlaku — satu penawar tidak bisa menetralkan "
-        "semua racun sekaligus.</i>\n\n"
-        "<b>▰▰▰ SEMUA POLA YANG TERPICU ▰▰▰</b>\n"
+        f"◈ <b>Waktu:</b> {waktu}\n"
+        f"◈ <b>Keterangan:</b> {jumlah_racun} pola spam berbeda cocok sekaligus — "
+        "whitelist individual tidak berlaku untuk kasus keroyokan\n\n"
         f"{daftar_racun}"
         f"{info_penawar}"
-        "<b>▰▰▰ KONTEN PESAN ▰▰▰</b>\n"
-        f"<code>{html.escape(content[:400])}</code>"
+        f"📨 <b>Konten:</b>\n<code>{html.escape(content[:400])}</code>"
     )
     try:
         await client.send_message(
@@ -845,6 +836,7 @@ async def nexus_silent_filter(client: Client, message: Message):
             f"Nexus AI — {(kata_kunci.split(']', 1)[-1].strip() if ']' in kata_kunci else kata_kunci)[:80]}",
             uid, (message.from_user.first_name or str(uid))[:50],
             content[:100],
+            jenis=VIOLATION_NEXUS_AI,
         ))
         # [PASSIVE LEARNING] Pesan dihapus → AI auto-learn spam
         # force_learn=True untuk CategoryDetector (rule-based, sudah pasti spam)
@@ -916,6 +908,7 @@ async def nexus_silent_filter(client: Client, message: Message):
         f"Nexus AI Multi-Pola ({len(matched)} cocok) — {_alasan_keroyok[:80]}",
         uid, (message.from_user.first_name or str(uid))[:50],
         content[:100],
+        jenis=VIOLATION_NEXUS_AI,
     ))
     # [PASSIVE LEARNING] Keroyokan = spam sangat meyakinkan → auto-learn paksa
     if _AI_CORE_AVAILABLE:
