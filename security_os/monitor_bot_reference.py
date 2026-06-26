@@ -122,6 +122,18 @@ VC_JOIN_RECHECK_SECS = int(os.environ.get("VC_JOIN_RECHECK_SECS", BIO_TTL_SECS))
 # Naikkan jika masih kena FloodWait, turunkan jika mau lebih responsif.
 _BIO_QUEUE_DELAY = float(os.environ.get("BIO_QUEUE_DELAY", 1.5))
 
+# Timeout (detik) _enqueue_bio_check menunggu HASIL satu kali fetch bio.
+# Ini BUKAN soal "berapa lama tunggu sampai nyerah karena macet/FloodWait" —
+# ini soal "berapa lama tunggu satu fetch yang NORMAL selesai". Fetch normal
+# (tidak FloodWait) biasanya selesai dalam BIO_QUEUE_DELAY s/d ~1.5 detik.
+# Default 4 detik: cukup longgar untuk fetch normal + 1-2 antrian di depan,
+# tapi tidak bikin grup nge-lag lama kalau memang macet/FloodWait/Bengkel
+# belum sempat masuk. JANGAN diset 0 — itu bikin SEMUA fetch (termasuk yang
+# normal & cepat) selalu dianggap "belum selesai" walau sebenarnya tinggal
+# sepersekian detik lagi, sehingga bio-link-detector & VIP-bio-text efektif
+# nonaktif untuk pesan pertama siapapun, bukan cuma saat macet.
+_ENQUEUE_TIMEOUT = float(os.environ.get("BIO_ENQUEUE_TIMEOUT_SECS", 4.0))
+
 # Jeda antar fetch di _cache_fill_worker (background loop per instance).
 # 3 detik default — lebih lambat dari _bio_worker karena tidak mendesak.
 _BIO_FILL_DELAY = float(os.environ.get("BIO_FILL_DELAY_SECS", 3.0))
@@ -244,6 +256,34 @@ class MonitorInstance:
 
         # ── Background cache fill worker ──────────────────────────────────────
         self._fill_worker_task: Optional[asyncio.Task] = None
+
+        # ── State FloodWait & "freeze" (dipinjam bot Bengkel) ──────────────────
+        # busy_until: monotonic timestamp; instance dianggap FloodWait sampai
+        # waktu ini terlewati. Diset oleh _bio_worker saat _fetch_bio gagal
+        # dengan FloodWait, dibaca oleh workshop_join_pool untuk memutuskan
+        # kapan grup ini perlu dibantu Bengkel.
+        self.busy_until: float = 0.0
+        # frozen: True selagi grup ini dalam mode kerja gabungan (≥1 Bengkel
+        # confirmed joined). Saat frozen, _bio_worker instance ASLI berhenti
+        # memproses queue sendiri — _GroupWorkRotation yang konsumsi queue &
+        # _recent_active ini secara bergantian (round-robin, termasuk giliran
+        # pemantau sendiri lewat self.client), supaya tidak ada 2 consumer
+        # yang sama-sama proses 1 queue bersamaan.
+        self.frozen: bool = False
+
+    def is_floodwait(self, now: float | None = None) -> bool:
+        """True jika instance ini sedang dianggap FloodWait (busy_until belum lewat)."""
+        return (now if now is not None else time.monotonic()) < self.busy_until
+
+    def mark_floodwait(self, seconds: float) -> None:
+        """
+        Tandai instance ini FloodWait selama `seconds` detik ke depan.
+        Dipanggil dari _bio_worker setiap kali _fetch_bio menangkap FloodWait
+        di langkah manapun (lihat _fetch_bio) — bukan cuma dicatat lokal,
+        tapi disimpan di instance supaya workshop_join_pool bisa membaca
+        status grup ini dari luar tanpa perlu akses ke detail fetch.
+        """
+        self.busy_until = max(self.busy_until, time.monotonic() + seconds)
 
     # ── TTL helper (jitter per instance) ─────────────────────────────────────
 
@@ -373,6 +413,11 @@ class MonitorInstance:
             try:
                 full = await self.client.invoke(raw_fns.users.GetFullUser(id=peer))
                 return getattr(full.full_user, "about", None) or ""
+            except FloodWait:
+                # JANGAN ditelan di sini — caller (langkah 1-4 di bawah) perlu
+                # tahu ini FloodWait, bukan kegagalan biasa, supaya bisa
+                # mark_floodwait() di level instance (dibaca workshop_join_pool).
+                raise
             except Exception:
                 return None
 
@@ -384,6 +429,7 @@ class MonitorInstance:
                 return bio
         except FloodWait as fw:
             print(f"[Monitor {self.chat_id}] FloodWait {fw.value}s uid={user_id}")
+            self.mark_floodwait(fw.value + 1)
             await asyncio.sleep(fw.value + 1)
             return None
         except (PeerIdInvalid, KeyError):
@@ -404,10 +450,14 @@ class MonitorInstance:
                     if bio is not None:
                         print(f"[Monitor {self.chat_id}] uid={user_id}: bio via get_chat_member ✓")
                         return bio
+                except FloodWait as fw_inner:
+                    self.mark_floodwait(fw_inner.value + 1)
+                    raise
                 except Exception:
                     pass
         except FloodWait as fw2:
             print(f"[Monitor {self.chat_id}] FloodWait (fallback2) {fw2.value}s uid={user_id}")
+            self.mark_floodwait(fw2.value + 1)
             await asyncio.sleep(fw2.value + 1)
             return None
         except Exception as e2:
@@ -426,6 +476,10 @@ class MonitorInstance:
             if bio is not None:
                 print(f"[Monitor {self.chat_id}] uid={user_id}: bio via access_hash=0 ✓")
                 return bio
+        except FloodWait as fw3:
+            self.mark_floodwait(fw3.value + 1)
+            await asyncio.sleep(fw3.value + 1)
+            return None
         except Exception:
             pass
 
@@ -441,6 +495,7 @@ class MonitorInstance:
                     return bio
         except FloodWait as fw4:
             print(f"[Monitor {self.chat_id}] FloodWait (fallback4) {fw4.value}s uid={user_id}")
+            self.mark_floodwait(fw4.value + 1)
             await asyncio.sleep(fw4.value + 1)
         except Exception:
             pass
@@ -456,9 +511,22 @@ class MonitorInstance:
         Jeda _BIO_QUEUE_DELAY detik antar request untuk menghindari FloodWait
         saat banyak grup ramai dan banyak user masuk antrian bersamaan.
 
-        Ini adalah SATU-SATUNYA tempat GetFullUser dipanggil.
+        Ini adalah SATU-SATUNYA tempat GetFullUser dipanggil — KECUALI saat
+        instance ini di-freeze (self.frozen=True), di mana _GroupWorkRotation
+        (core/workshop_join_pool.py) yang mengambil alih konsumsi _bio_queue &
+        _recent_active instance ini selama mode kerja gabungan. Worker INI
+        (_bio_worker) cuma idle-poll tanpa konsumsi apapun selagi frozen —
+        "giliran pemantau" dalam rotasi tetap dilayani, tapi lewat
+        koordinator rotasi (pakai self.client yang sama), bukan loop ini,
+        supaya tidak ada 2 consumer yang bersaing ambil dari queue yang sama.
         """
         while not self._stopped:
+            if self.frozen:
+                # Sedang mode kerja gabungan — giliran pemantau dilayani lewat
+                # _GroupWorkRotation (workshop_join_pool.py), bukan loop ini.
+                # Jangan konsumsi queue di sini, cek lagi sebentar.
+                await asyncio.sleep(1.0)
+                continue
             try:
                 user_id, future = await asyncio.wait_for(
                     self._bio_queue.get(), timeout=5.0
@@ -484,16 +552,66 @@ class MonitorInstance:
                 if not self._stopped:
                     await asyncio.sleep(_BIO_QUEUE_DELAY)
 
+    def drain_queue(self) -> int:
+        """
+        Kosongkan _bio_queue instance ini SEKARANG — batalkan semua future
+        yang masih menunggu (caller-nya, mis. force_check_user yang sedang
+        di-await, akan langsung dapat None alih-alih timeout 30 detik).
+
+        Dipanggil oleh workshop_join_pool TEPAT SEBELUM freeze, saat instance
+        ini terdeteksi FloodWait dan Bengkel akan mengambil alih. User yang
+        memang masih perlu dicek akan otomatis di-enqueue ULANG oleh Bengkel
+        sendiri (lewat _recent_active yang masih ada / request baru yang
+        datang selagi Bengkel aktif) — bukan tugas drain_queue ini.
+
+        Return: jumlah item yang dibuang (untuk logging).
+        """
+        drained = 0
+        while True:
+            try:
+                user_id, future = self._bio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._bio_queue_pending.discard(user_id)
+            if not future.done():
+                try:
+                    future.set_result(None)
+                except Exception:
+                    pass
+            self._bio_queue.task_done()
+            drained += 1
+        return drained
+
     async def _enqueue_bio_check(self, user_id: int) -> "bool | None":
         """
-        Masukkan user_id ke antrian bio-check dan tunggu hasilnya.
-        Jika user sudah dalam antrian (dedup via _bio_queue_pending),
-        langsung baca DB yang ada daripada antri dua kali.
+        Masukkan user_id ke antrian bio-check dan tunggu hasilnya, maksimal
+        _ENQUEUE_TIMEOUT detik.
+
+        Kenapa 4 detik (bukan 30, bukan 0):
+          - Fetch NORMAL (tidak FloodWait, tidak macet) cuma butuh sekitar
+            _BIO_QUEUE_DELAY s/d ~1.5 detik dari saat masuk antrian sampai
+            hasil siap — 4 detik cukup longgar untuk itu (termasuk kalau ada
+            1-2 antrian lain di depannya), jadi mayoritas pemanggil TETAP
+            dapat hasil fetch yang sebenarnya, bukan langsung nyerah.
+          - Kalau memang macet/FloodWait/queue menumpuk (mis. instance
+            sedang frozen menunggu Bengkel, atau Bengkel sendiri kena
+            FloodWait), 4 detik tetap jauh lebih singkat dari 30 detik lama
+            — grup tidak nge-lag lama menunggu satu pesan diputuskan.
 
         Dipanggil oleh:
           - check_and_save(force=True)  — join grup, VC, perubahan profil
           - _cache_fill_worker          — pengisian cache background
           - force_check_user (via bio.py) — hanya saat cache kosong
+
+        CATATAN BENGKEL: kalau instance sedang frozen, _bio_worker tidak
+        konsumsi queue ini — _GroupWorkRotation (core/workshop_join_pool.py)
+        yang konsumsi queue yang sama secara round-robin (giliran pemantau +
+        giliran tiap Bengkel yang confirmed joined). Kalau belum ada Bengkel
+        confirmed joined sama sekali (masih di _pending_groups / masih proses
+        verifikasi join), queue ini akan timeout di sini setelah 4 detik —
+        bio.py punya fallback ke workshop_pool standalone setelahnya (dan
+        is_pending_for_bengkel() membuat bio.py malah skip menunggu di sini
+        sama sekali untuk kasus itu, lihat plugins/filters/bio.py).
         """
         if user_id in self._bio_queue_pending:
             # Sudah antri — kembalikan data DB sementara (tidak menambah antrian)
@@ -505,9 +623,9 @@ class MonitorInstance:
         self._bio_queue_pending.add(user_id)
         await self._bio_queue.put((user_id, future))
         try:
-            return await asyncio.wait_for(asyncio.shield(future), timeout=30.0)
+            return await asyncio.wait_for(asyncio.shield(future), timeout=_ENQUEUE_TIMEOUT)
         except asyncio.TimeoutError:
-            print(f"[Monitor {self.chat_id}] _enqueue timeout uid={user_id}")
+            print(f"[Monitor {self.chat_id}] _enqueue timeout ({_ENQUEUE_TIMEOUT}s) uid={user_id}")
             return None
         except Exception as e:
             print(f"[Monitor {self.chat_id}] _enqueue error uid={user_id}: {e}")
@@ -587,6 +705,15 @@ class MonitorInstance:
         """
         while not self._stopped:
             try:
+                if self.frozen:
+                    # Mode kerja gabungan aktif — jangan tambah beban ke
+                    # _bio_queue dari sisi ini. _GroupWorkRotation yang akan
+                    # mengisi cache user aktif selama freeze (baca
+                    # _recent_active milik instance ini secara bergantian,
+                    # termasuk lewat giliran pemantau sendiri).
+                    await asyncio.sleep(2.0)
+                    continue
+
                 now        = time.time()
                 candidates = [
                     uid for uid, last_seen in list(self._recent_active.items())

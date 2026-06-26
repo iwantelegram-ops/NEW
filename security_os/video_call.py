@@ -134,7 +134,10 @@ _vip_cache: dict[tuple[int, int], tuple[bool, float]] = {}
 _VIP_CACHE_TTL = 180.0   # detik
 
 # ── Alasan warning tertunda (dihapus setelah _do_send_warning memakai) ────────
-_pending_warn_reason: dict[tuple[int, int], str] = {}
+# Value: (reason: str, kode: str) — kode adalah VIOLATION_VC_MUTE_* dari
+# core/violation_types.py, diisi oleh _execute_kick agar _do_send_warning
+# TIDAK perlu menebak ulang jenis lewat keyword-matching pada teks reason.
+_pending_warn_reason: dict[tuple[int, int], tuple[str, str]] = {}
 
 # ── Global lock inspeksi dadakan via /unmutemic (hindari concurrent floodwait) ─
 _vc_inspection_lock: asyncio.Lock | None = None
@@ -337,11 +340,15 @@ def _enqueue_mute_mic(
     user_id: int,
     call_input,
     reason: str = "bio mengandung link",
+    kode: str | None = None,
 ) -> None:
     """
     Masukkan permintaan mute mic ke antrean grup ini.
     Jika (chat_id, user_id) sudah antri tindakan mic, skip duplikat.
     Spawn worker jika belum ada.
+
+    kode : VIOLATION_VC_MUTE_* (core/violation_types.py) — diteruskan ke
+           worker untuk logging LOG_OS + panel grup yang seragam.
     """
     key = (chat_id, user_id)
     if key in _mic_pending:
@@ -349,7 +356,7 @@ def _enqueue_mute_mic(
         return
     _mic_pending.add(key)
     q = _get_mic_queue(chat_id)
-    q.put_nowait(("mute", user_id, call_input, reason))
+    q.put_nowait(("mute", user_id, call_input, reason, kode))
     _ensure_mic_worker(chat_id)
 
 
@@ -358,11 +365,15 @@ def _enqueue_unmute_mic(
     user_id: int,
     call_input,
     reason: str = "bio bersih",
+    kode: str | None = None,
 ) -> None:
     """
     Masukkan permintaan unmute mic ke antrean grup ini.
     Jika (chat_id, user_id) sudah antri tindakan mic, skip duplikat.
     Spawn worker jika belum ada.
+
+    kode : VIOLATION_VC_UNMUTE secara default (core/violation_types.py) —
+           diteruskan ke worker untuk logging LOG_OS + panel grup.
     """
     key = (chat_id, user_id)
     if key in _mic_pending:
@@ -370,7 +381,7 @@ def _enqueue_unmute_mic(
         return
     _mic_pending.add(key)
     q = _get_mic_queue(chat_id)
-    q.put_nowait(("unmute", user_id, call_input, reason))
+    q.put_nowait(("unmute", user_id, call_input, reason, kode))
     _ensure_mic_worker(chat_id)
 
 
@@ -398,7 +409,7 @@ async def _mic_action_worker(chat_id: int) -> None:
         except asyncio.QueueEmpty:
             break
 
-        action, user_id, call_input, reason = item
+        action, user_id, call_input, reason, kode = item
         key = (chat_id, user_id)
         try:
             if action == "mute":
@@ -406,6 +417,12 @@ async def _mic_action_worker(chat_id: int) -> None:
                 await _kick_from_voice(chat_id, user_id, call_input)
             elif action == "unmute":
                 print(f"[Mic-Worker] Unmute mic uid={user_id} grup={chat_id} — alasan: {reason}")
+                # _unmute_user_in_vc menangani LOG_OS + panel grup SENDIRI
+                # secara internal (hanya jika perubahan status nyata terjadi)
+                # — lihat docstring fungsi tersebut. `kode` di sini hanya
+                # tersedia untuk konsistensi tanda tangan _mic_action_worker,
+                # tidak perlu diteruskan karena _unmute_user_in_vc memakai
+                # VIOLATION_VC_UNMUTE registry secara langsung.
                 await _unmute_user_in_vc(chat_id, user_id, call_input)
         except FloodWait as fw:
             wait_sec = fw.value + 2
@@ -544,6 +561,54 @@ async def _check_vc_manage_permission(chat_id: int) -> bool:
 def _invalidate_vc_perm_cache(chat_id: int) -> None:
     """Hapus cache izin userbot untuk grup ini (mis. setelah re-promote)."""
     _vc_perm_cache.pop(chat_id, None)
+
+
+# ── Cache status admin userbot per chat_id (TTL 5 menit) ─────────────────────
+_ub_admin_cache: dict[int, tuple[bool, float]] = {}
+_UB_ADMIN_CACHE_TTL = 300.0
+
+
+async def is_userbot_admin(chat_id: int) -> bool:
+    """
+    True jika userbot adalah ADMINISTRATOR (bukan member biasa) di chat_id.
+
+    Dipakai sebagai guard untuk:
+      1. check_activation_prerequisites — blokir aktivasi Security OS
+         jika userbot hanya member biasa.
+      2. _assign_bengkel di workshop_join_pool — skip invite bot bengkel
+         jika userbot tidak punya hak invite_users.
+
+    Cache 5 menit. Gagal query → fail-closed (return False) karena ini
+    dipakai sebagai gate — lebih aman tolak daripada lolos diam-diam.
+    """
+    cached = _ub_admin_cache.get(chat_id)
+    if cached:
+        is_admin, ts = cached
+        if time.monotonic() - ts < _UB_ADMIN_CACHE_TTL:
+            return is_admin
+
+    if not userbot:
+        return False
+
+    try:
+        from pyrogram.enums import ChatMemberStatus
+        me     = userbot.me
+        member = await userbot.get_chat_member(chat_id, me.id)
+        is_admin = member.status in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        )
+    except Exception as e:
+        print(f"[UB] Gagal cek status admin userbot grup={chat_id}: {e} — anggap bukan admin")
+        is_admin = False  # fail-closed
+
+    _ub_admin_cache[chat_id] = (is_admin, time.monotonic())
+    return is_admin
+
+
+def invalidate_ub_admin_cache(chat_id: int) -> None:
+    """Hapus cache admin userbot untuk grup ini (dipanggil saat promote/demote)."""
+    _ub_admin_cache.pop(chat_id, None)
 
 
 # ── Cache bio per user per grup (dua lapis) ──────────────────────────────────
@@ -1665,6 +1730,9 @@ async def _voice_chat_monitor_loop() -> None:
                                 f"[UB-VC] uid={uid} grup={chat_id}: di-unmute admin lain "
                                 "tapi bio masih ada link → mute mic ulang."
                             )
+                        # kode tidak diisi → _execute_kick fallback ke
+                        # VIOLATION_VC_MUTE_BIO_LINK (default-nya memang
+                        # kasus ini: bio masih ada link dari cache).
                         _safe_task(
                             _execute_kick(chat_id, uid, call_input, was_already_muted=is_muted),
                             tag="exec-kick-cache",
@@ -2281,6 +2349,9 @@ async def _query_monitor_then_kick(
         # ── Perubahan 1: Non-member → mute mic langsung tanpa cek bio ────────
         # User yang bukan anggota grup tidak boleh di obrolan suara grup.
         # Mute dilakukan terlepas ada/tidaknya link di bio, lalu dicatat di DB.
+        from core.violation_types import (
+            VIOLATION_VC_MUTE_NON_MEMBER, VIOLATION_VC_MUTE_PEER, VIOLATION_VC_MUTE_BIO_LINK,
+        )
         is_member = await _is_group_member(chat_id, user_id)
         if is_member is False:
             reason_nm = "non-member grup naik ke obrolan suara"
@@ -2294,6 +2365,7 @@ async def _query_monitor_then_kick(
                 chat_id, user_id, call_input,
                 was_already_muted=is_muted,
                 reason=reason_nm,
+                kode=VIOLATION_VC_MUTE_NON_MEMBER,
             )
             # Fitur 1: Catat ke secos_muted_users (TTL 30 detik)
             _secos_record_mute(chat_id, user_id, "non_member")
@@ -2350,6 +2422,7 @@ async def _query_monitor_then_kick(
                 chat_id, user_id, call_input,
                 was_already_muted=is_muted,
                 reason="bio mengandung link",
+                kode=VIOLATION_VC_MUTE_BIO_LINK,
             )
             # has_link=True dari bot pemantau = bio berhasil dibaca & ada link.
             # Ini BUKAN peer_invalid — tidak perlu follow-up khusus.
@@ -2368,6 +2441,7 @@ async def _query_monitor_then_kick(
                 chat_id, user_id, call_input,
                 was_already_muted=is_muted,
                 reason="tidak dikenali bot pemantau (peer tidak dapat di-resolve)",
+                kode=VIOLATION_VC_MUTE_PEER,
             )
             _secos_record_mute(chat_id, user_id, "peer_invalid")
             _secos_schedule_followup(chat_id, [(user_id, "peer_invalid")])
@@ -2696,16 +2770,21 @@ _monitor_username_cache: dict[int, str] = {}
 # LOG OS — kirim log mute/unmute userbot ke channel khusus LOG_OS
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _log_os_action(chat_id: int, user_id: int, action: str, reason: str) -> None:
+async def _log_os_action(chat_id: int, user_id: int, kode: str, reason: str) -> None:
     """
     Kirim log tindakan userbot (mute/unmute mic) ke channel LOG_OS.
 
-    action : label singkat, contoh "MUTE-MIC" atau "UNMUTE-MIC"
-    reason : keterangan detail, contoh "bio mengandung link" atau "non-member grup"
+    kode   : kode VIOLATION_VC_* dari core/violation_types.py — menentukan
+             icon + label header (SAMA dengan yang dipakai panel log grup
+             untuk tindakan mic yang sama, lihat insert_group_action_log
+             di pemanggil _log_os_action).
+    reason : keterangan detail bebas, contoh "bio mengandung link".
     """
     if not LOG_OS or not _bot_ref:
         return
     try:
+        from core.violation_types import format_violation_header
+
         name  = str(user_id)
         uname = f"id:{user_id}"
         try:
@@ -2715,14 +2794,13 @@ async def _log_os_action(chat_id: int, user_id: int, action: str, reason: str) -
         except Exception:
             pass
 
-        icon   = "🔇" if "MUTE" in action.upper() and "UNMUTE" not in action.upper() else "🔊"
         waktu  = _dt_vc.now(_WIB_VC).strftime("%H:%M:%S · %d %b %Y WIB")
         text = (
-            f"{icon} <b>Security OS — {action}</b>\n"
-            f"<code>Grup : {chat_id}</code>\n"
-            f"👤 {_html_vc.escape(name)} (<code>{user_id}</code>) {_html_vc.escape(uname)}\n"
-            f"📌 Alasan : {reason}\n"
-            f"🕐 {waktu}"
+            f"<b>❖ {format_violation_header(kode)} ❖</b>\n"
+            f"◈ <b>Grup:</b> <code>{chat_id}</code>\n"
+            f"◈ <b>User:</b> {_html_vc.escape(name)} (<code>{user_id}</code>) {_html_vc.escape(uname)}\n"
+            f"◈ <b>Waktu:</b> {waktu}\n"
+            f"◈ <b>Alasan:</b> {_html_vc.escape(str(reason))}"
         )
         await _bot_ref.send_message(LOG_OS, text, parse_mode=ParseMode.HTML)
     except FloodWait as fw:
@@ -2953,6 +3031,7 @@ async def _execute_kick(
     call_input,
     was_already_muted: bool = False,
     reason: str = "bio mengandung link",
+    kode: str | None = None,
 ) -> None:
     """
     Mute mic user dari voice chat, lalu antrekan peringatan ke grup.
@@ -2961,7 +3040,11 @@ async def _execute_kick(
     Dalam kasus ini: SKIP sepenuhnya — tidak mute ulang, tidak LOG_OS, tidak notif.
     LOG_OS dan notif hanya dikirim untuk PERUBAHAN STATUS NYATA (unmuted → muted).
 
-    reason: alasan mute — diteruskan ke _do_send_warning dan LOG_OS.
+    reason : alasan mute (teks bebas) — diteruskan ke _do_send_warning dan LOG_OS.
+    kode   : kode VIOLATION_VC_MUTE_* (core/violation_types.py) — WAJIB diisi oleh
+             pemanggil, menentukan icon + label seragam di LOG_OS & panel grup.
+             Default None hanya untuk kompatibilitas tanda tangan lama; jika
+             None, fallback ke VIOLATION_VC_MUTE_BIO_LINK (kasus paling umum).
 
     Alur (dengan Mic Worker Queue):
       1. Jika was_already_muted=True → skip seluruhnya (tidak ada perubahan status)
@@ -2971,6 +3054,9 @@ async def _execute_kick(
       4. Catat ke DB (vc_muted_by_ub)
       5. Antrekan notifikasi grup hanya jika perubahan status nyata
     """
+    from core.violation_types import VIOLATION_VC_MUTE_BIO_LINK
+    if kode is None:
+        kode = VIOLATION_VC_MUTE_BIO_LINK
     try:
         # ── VIP Guard — cek sebelum APAPUN ────────────────────────────────────
         if await _is_vip_user(chat_id, user_id):
@@ -2988,13 +3074,13 @@ async def _execute_kick(
             return
 
         # ── Antri mute mic ke worker — eksekusi berurutan per grup ────────────
-        _enqueue_mute_mic(chat_id, user_id, call_input, reason)
+        _enqueue_mute_mic(chat_id, user_id, call_input, reason, kode=kode)
         # LOG_OS: perubahan status nyata (unmuted → muted) — dicatat di sini
-        _safe_task(_log_os_action(chat_id, user_id, "MUTE-MIC", reason), tag="log-os")
+        _safe_task(_log_os_action(chat_id, user_id, kode, reason), tag="log-os")
         # Catat ke DB bahwa userbot yang mute-kan user ini
         _safe_task(_record_ub_muted(chat_id, user_id), tag="record-muted")
         # Notifikasi grup: perubahan status nyata
-        _pending_warn_reason[(chat_id, user_id)] = reason
+        _pending_warn_reason[(chat_id, user_id)] = (reason, kode)
         _enqueue_warning(chat_id, user_id)
 
     except Exception as e:
@@ -3117,8 +3203,9 @@ async def _unmute_user_in_vc(chat_id: int, user_id: int, call_input) -> None:
 
         # Perubahan 2: log unmute ke channel LOG_OS
         if changed:
+            from core.violation_types import VIOLATION_VC_UNMUTE
             _safe_task(
-                _log_os_action(chat_id, user_id, "UNMUTE-MIC", "bio bersih / tidak ada link"),
+                _log_os_action(chat_id, user_id, VIOLATION_VC_UNMUTE, "bio bersih / tidak ada link"),
                 tag="log-os-unmute",
             )
 
@@ -3163,12 +3250,14 @@ async def _unmute_user_in_vc(chat_id: int, user_id: int, call_input) -> None:
             # Catat ke log aktivitas grup — perubahan status nyata (muted → unmuted)
             try:
                 from database import insert_group_action_log
+                from core.violation_types import VIOLATION_VC_UNMUTE
                 await insert_group_action_log(
                     chat_id,
                     "UNMUTE-VC-MIC",
                     "Security OS: mic diaktifkan kembali (bio bersih / tidak ada link)",
                     user_id,
                     name[:50],
+                    jenis=VIOLATION_VC_UNMUTE,
                 )
             except Exception as _e_log:
                 print(f"[UB-Unmute] Gagal catat log unmute uid={user_id}: {_e_log}")
@@ -3200,6 +3289,9 @@ async def _do_send_warning(chat_id: int, user_id: int) -> None:
         return
     try:
         from database import insert_group_action_log
+        from core.violation_types import (
+            VIOLATION_VC_MUTE_NON_MEMBER, VIOLATION_VC_MUTE_PEER, VIOLATION_VC_MUTE_BIO_LINK,
+        )
 
         # Ambil nama user
         name = str(user_id)
@@ -3211,25 +3303,27 @@ async def _do_send_warning(chat_id: int, user_id: int) -> None:
 
         mention = f"<a href='tg://user?id={user_id}'>{_html_vc.escape(name)}</a>"
 
-        # Kirim peringatan di grup via bot biasa — tangani FloodWait
-        # Perubahan 2: ambil alasan dari _pending_warn_reason
-        warn_reason = _pending_warn_reason.pop((chat_id, user_id), "bio mengandung link")
+        # Ambil (reason, kode) yang DIISI _execute_kick — kode adalah sumber
+        # kebenaran jenis mute, BUKAN ditebak ulang dari teks reason.
+        warn_reason, kode = _pending_warn_reason.pop(
+            (chat_id, user_id), ("bio mengandung link", VIOLATION_VC_MUTE_BIO_LINK)
+        )
 
         # Tentukan warn_type untuk cek 1× seumur hidup
-        if "non-member" in warn_reason:
+        if kode == VIOLATION_VC_MUTE_NON_MEMBER:
             warn_type = "vc_nonmember"
-        elif "peer tidak dikenal" in warn_reason or "peer_invalid" in warn_reason:
+        elif kode == VIOLATION_VC_MUTE_PEER:
             warn_type = "vc_peer"
         else:
             warn_type = "vc_bio"
 
-        if "non-member" in warn_reason:
+        if kode == VIOLATION_VC_MUTE_NON_MEMBER:
             warn_msg = (
                 f"🔇 {mention} mic-nya di-mute di obrolan suara.\n"
                 f"<i>Anda bukan anggota grup ini. "
                 f"Bergabunglah ke grup terlebih dahulu agar mic dapat diaktifkan.</i>"
             )
-        elif "peer tidak dikenal" in warn_reason or "peer_invalid" in warn_reason:
+        elif kode == VIOLATION_VC_MUTE_PEER:
             warn_msg = (
                 f"🔇 {mention} mic-nya di-mute sementara di obrolan suara.\n"
                 f"<i>Profil Anda belum dapat diverifikasi. "
@@ -3271,21 +3365,15 @@ async def _do_send_warning(chat_id: int, user_id: int) -> None:
                     pass
             asyncio.create_task(_auto_delete_warn())
 
-        # Catat ke log aktivitas grup (fungsi asli database.py)
-        # Tentukan label alasan yang tepat berdasarkan warn_reason
-        if "non-member" in warn_reason:
-            log_alasan = "Security OS: bukan anggota grup, mic di-mute di obrolan suara"
-        elif "peer tidak dikenal" in warn_reason or "peer_invalid" in warn_reason:
-            log_alasan = "Security OS: profil belum terverifikasi, mic di-mute sementara"
-        else:
-            log_alasan = "Security OS: bio mengandung link, mic di-mute di obrolan suara"
-
+        # Catat ke log aktivitas grup (panel) — `kode` SAMA dengan yang
+        # dipakai LOG_OS di _log_os_action, sehingga icon + label seragam.
         await insert_group_action_log(
             chat_id,
             "MUTE-VC-MIC",
-            log_alasan,
+            warn_reason,
             user_id,
             name[:50],
+            jenis=kode,
         )
 
         # Hapus cache bio user ini agar bisa naik lagi setelah benahi bio
@@ -3670,10 +3758,11 @@ async def check_activation_prerequisites(
 
     Syarat WAJIB (memblokir aktivasi):
       1. Userbot sudah online
-      2. Bot pemantau sudah dikonfigurasi di DB
+      2. Userbot adalah admin di grup (bukan member biasa)
+      3. Bot pemantau sudah dikonfigurasi di DB
 
     Syarat OPSIONAL (warning saja, tidak memblokir):
-      3. Bot pemantau sudah jadi anggota grup
+      4. Bot pemantau sudah jadi anggota grup
          (bisa diaktifkan dulu, bot dikenali otomatis saat masuk)
 
     Return: (syarat_wajib_terpenuhi: bool, daftar_pesan: list[str])
@@ -3689,7 +3778,17 @@ async def check_activation_prerequisites(
             "dan bot sudah di-restart. Kemudian kirim OTP yang dikirim Telegram ke HP Anda."
         )
 
-    # ── Syarat wajib 2: bot pemantau sudah dikonfigurasi di DB ───────────────
+    # ── Syarat wajib 2: userbot adalah admin di grup ini ────────────────────
+    if is_userbot_ready():
+        _is_ub_admin = await is_userbot_admin(chat_id)
+        if not _is_ub_admin:
+            blockers.append(
+                "🔒 <b>Userbot bukan admin di grup ini.</b>\n"
+                "└ Jadikan userbot admin agar Security OS bisa diaktifkan.\n"
+                "   Hak minimal yang diperlukan: <b>Kelola Obrolan Video</b> + <b>Undang Pengguna</b>."
+            )
+
+    # ── Syarat wajib 3: bot pemantau sudah dikonfigurasi di DB ───────────────
     sec_doc = await _sec_os_get(chat_id)
     has_monitor_config = bool(sec_doc.get("monitor_bot_id", 0))
 
