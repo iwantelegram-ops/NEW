@@ -34,6 +34,7 @@ from database import (
 )
 from core.group_notify import send_group_notice
 from core.moderation_queue import queue_ban
+from core.violation_types import VIOLATION_CAS_BAN, VIOLATION_BAN_GAGAL, format_violation_header
 
 DELAY_NOTIF   = 10
 LOG_CHANNEL   = int(os.environ.get("LOG_CHANNEL", 0))
@@ -204,6 +205,7 @@ async def cas_auto_mod(client: Client, message: Message):
                     uid,
                     message.from_user.first_name or str(uid),
                     (message.text or message.caption or "")[:100],
+                    jenis=VIOLATION_CAS_BAN,
                 )
             except Exception:
                 pass
@@ -227,9 +229,7 @@ async def _log_cas_ban(client: Client, message: Message, waktu: str):
     content      = (message.text or message.caption or "—").strip()
 
     log_text = (
-        "<b>❖ BAN OTOMATIS — CAS SPAMMER TERVERIFIKASI ❖</b>\n"
-        "<blockquote>"
-        f"🚫 <b>Tipe:</b> Ban Permanen CAS Anti-Spam\n"
+        f"<b>❖ {format_violation_header(VIOLATION_CAS_BAN)} ❖</b>\n"
         f"◈ <b>User:</b> {user_mention}\n"
         f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {waktu}\n"
@@ -237,7 +237,6 @@ async def _log_cas_ban(client: Client, message: Message, waktu: str):
         f"◈ <b>Keterangan:</b> User terdaftar sebagai spammer global terverifikasi\n"
         f"◈ <b>Aksi:</b> Ban permanen + pesan dihapus\n\n"
         f"📨 <b>Konten saat terdeteksi:</b>\n<code>{html.escape(content[:500])}</code>"
-        "</blockquote>"
     )
     await _send_log(client, log_text)
 
@@ -256,16 +255,13 @@ async def _log_cas_ban_failed(client: Client, message: Message):
     user_mention = _user_line(uid, message.from_user.first_name)
 
     log_text = (
-        "<b>❖ BAN GAGAL — IZIN BOT TIDAK CUKUP ❖</b>\n"
-        "<blockquote>"
-        f"⚠️ <b>Tipe:</b> CAS Ban Gagal Dieksekusi\n"
+        f"<b>❖ {format_violation_header(VIOLATION_BAN_GAGAL)} ❖</b>\n"
         f"◈ <b>User:</b> {user_mention}\n"
         f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
         f"◈ <b>Keterangan:</b> User terdeteksi spammer CAS, namun ban tidak berhasil\n"
         f"◈ <b>Sebab gagal:</b> Bot bukan admin / tidak punya izin ban member\n"
         f"<i>Pesan sudah dihapus, namun user TIDAK ter-ban — cek izin admin bot.</i>"
-        "</blockquote>"
     )
     await _send_log(client, log_text)
 

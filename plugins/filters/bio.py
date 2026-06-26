@@ -56,6 +56,7 @@ from database import (
     check_bot_permissions,
 )
 from core.punishment import check_and_punish
+from core.violation_types import VIOLATION_BIO_LINK, format_violation_header
 
 free_col    = db["free_per_group"]
 bio_col     = db["bio_profiles"]    # Ditulis oleh bot pemantau masing-masing grup
@@ -370,13 +371,26 @@ async def bio_filter(client: Client, message: Message):
 
     # ── Step 2: Tidak ada data → paksa bot pemantau cek langsung ─────────────
     if has_link is None:
+        # Cek dulu: kalau grup ini sedang menunggu slot Bengkel (semua
+        # Bengkel sibuk di grup lain), force_check_user PASTI timeout 30s
+        # (queue instance ini menumpuk, tidak ada yang konsumsi selagi
+        # pending). Lompat langsung ke workshop_pool standalone supaya tidak
+        # bikin pesan user menunggu lama tanpa alasan.
+        skip_force_check = False
         try:
-            from monitor_bot_reference import force_check_user
-            has_link = await force_check_user(cid, uid)
-            if has_link is not None:
-                _update_mem_cache(cid, uid, has_link)
+            from core.workshop_join_pool import is_pending_for_bengkel
+            skip_force_check = is_pending_for_bengkel(cid)
         except Exception:
             pass
+
+        if not skip_force_check:
+            try:
+                from monitor_bot_reference import force_check_user
+                has_link = await force_check_user(cid, uid)
+                if has_link is not None:
+                    _update_mem_cache(cid, uid, has_link)
+            except Exception:
+                pass
         # FALLBACK BENGKEL: MonitorInstance grup ini tidak aktif/gagal
         # (belum setup token monitor, atau sedang FloodWait) → coba pool
         # token backup (workshop_pool). Hasilnya ditulis ke bio_profiles
@@ -412,6 +426,7 @@ async def bio_filter(client: Client, message: Message):
                 uid,
                 message.from_user.first_name or str(uid),
                 (message.text or message.caption or "")[:100],
+                jenis=VIOLATION_BIO_LINK,
             )
         except Exception:
             pass
@@ -557,9 +572,7 @@ async def _log_bio_deletion(client: Client, message: Message):
         bio_snippet = "(tidak diketahui)"
 
     log_text = (
-        "<b>❖ HAPUS OTOMATIS — BIO LINK DETECTOR ❖</b>\n"
-        "<blockquote>"
-        f"🔍 <b>Tipe:</b> Bio Link Detector\n"
+        f"<b>❖ {format_violation_header(VIOLATION_BIO_LINK)} ❖</b>\n"
         f"◈ <b>User:</b> {user_mention}\n"
         f"◈ <b>Grup:</b> {html.escape(message.chat.title)} (<code>{cid}</code>)\n"
         f"◈ <b>Waktu:</b> {_fmt_waktu()}\n"
@@ -567,7 +580,6 @@ async def _log_bio_deletion(client: Client, message: Message):
         f"◈ <b>Kebijakan:</b> Pesan dari user berbio link dihapus otomatis\n"
         f"◈ <b>Bio terdeteksi:</b> <code>{html.escape(str(bio_snippet))}</code>\n\n"
         f"📨 <b>Konten pesan:</b>\n<code>{html.escape(content[:400])}</code>"
-        "</blockquote>"
     )
     try:
         await client.send_message(
